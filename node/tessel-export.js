@@ -240,23 +240,22 @@ Tessel.Port = function(name, socketPath, board) {
           var pin = this.pin[(byte - REPLY.ASYNC_PIN_CHANGE_N) & ~(1 << 3)];
           // Get the mode change
           var mode = pin.interruptMode;
+          // Get the pin value
+          var pinValue = (byte >> 3) & 1;
 
-          // If this was a one-time mode
+          // For one-time 'low' or 'high' event
           if (mode === 'low' || mode === 'high') {
+            pin.emit(mode);
             // Reset the pin interrupt state (prevent constant interrupts)
             pin.interruptMode = null;
             // Decrement the number of tasks waiting on the socket
             this.unref();
+          } else {
+            // Emit the change and rise or fall
+            pin.emit('change', pinValue);
+            pin.emit(pinValue ? 'rise' : 'fall');
           }
 
-          // Emit the change
-          if (mode === 'change') {
-            // "change" is otherwise ambiguous.
-            pin.emit('change', (byte >> 3) & 1);
-          } else {
-            // high, low, rise & fall are _not_ ambiguous
-            pin.emit(mode);
-          }
         } else {
           // Some other async event
           this.emit('async-event', byte);
@@ -341,12 +340,45 @@ Tessel.Port = function(name, socketPath, board) {
 
   this.pwm = [this.pin[5], this.pin[6]];
 
-  this.I2C = function I2CInit(address, mode) {
-    return new Tessel.I2C({
-      addr: address,
-      mode: mode,
-      port: port
-    });
+  this.I2C = function I2CInit(address) {
+    var options = {};
+
+    if (typeof address === 'object' && address != null) {
+      /*
+        {
+          addr: address,
+          freq: frequency,
+          port: port,
+        }
+      */
+      Object.assign(options, address);
+    } else {
+      /*
+        (address)
+      */
+      options.address = address;
+    }
+
+    /*
+      Always ensure that the options
+      object contains a port property
+      with this port as its value.
+    */
+    if (!options.port) {
+      options.port = port;
+    } else {
+      /*
+        When receiving an object containing
+        options information, it's possible that
+        the calling code accidentally sends
+        a "port" that isn't this port.
+      */
+      if (options.port !== port) {
+        options.port = port;
+      }
+    }
+
+    return new Tessel.I2C(options);
   };
 
   this.I2C.enabled = false;
@@ -552,33 +584,40 @@ Tessel.Pin.prototype.removeAllListeners = function(event) {
 };
 
 Tessel.Pin.prototype.addListener = function(mode, callback) {
+  // Check for valid pin event mode
   if (typeof Tessel.Pin.interruptModes[mode] !== 'undefined') {
     if (!this.interruptSupported) {
       throw new Error(`Interrupts are not supported on pin ${this.pin}. Pins 2, 5, 6, and 7 on either port support interrupts.`);
     }
 
-    if ((mode === 'high' || mode === 'low') && !callback.listener) {
+    // For one-time 'low' or 'high' event
+    if ((mode === 'low' || mode === 'high') && !callback.listener) {
       throw new Error('Cannot use "on" with level interrupts. You can only use "once".');
     }
 
-    if (this.interruptMode !== mode) {
-      if (this.interruptMode) {
-        throw new Error(`Cannot set pin interrupt mode to ${mode}; already listening for ${this.interruptMode}`);
+    // Can't set multiple listeners when using 'low' or 'high'
+    if (this.interruptMode) {
+      var singleEventModes = ['low', 'high'];
+      if (singleEventModes.some(value => mode === value || this.interruptMode === value)) {
+        throw new Error(`Cannot set pin interrupt mode to "${mode}"; already listening for "${this.interruptMode}". Can only set multiple listeners with "change", "rise" & "fall".`);
       }
-      // Set the socket reference so the script doesn't exit
-      this._port.ref();
-
-      this._setInterruptMode(mode);
     }
-  }
 
-  // Add the event listener
-  Tessel.Pin.super_.prototype.on.call(this, mode, callback);
+    // Set the socket reference so the script doesn't exit
+    this._port.ref();
+    this._setInterruptMode(mode);
+
+    // Add the event listener
+    Tessel.Pin.super_.prototype.on.call(this, mode, callback);
+  } else {
+    throw new Error(`Invalid pin event mode "${mode}". Valid modes are "change", "rise", "fall", "high" and "low".`);
+  }
 };
 Tessel.Pin.prototype.on = Tessel.Pin.prototype.addListener;
 
 Tessel.Pin.prototype._setInterruptMode = function(mode) {
-  this.interruptMode = mode;
+  // rise and fall events will be emitted by change event
+  this.interruptMode = (mode === 'rise' || mode === 'fall') ? 'change' : mode;
   var bits = mode ? Tessel.Pin.interruptModes[mode] << 4 : 0;
   this._port._simple_cmd([CMD.GPIO_INT, this.pin | bits]);
 };
@@ -756,6 +795,10 @@ Tessel.Pin.prototype.pwmDutyCycle = function(dutyCycle, cb) {
 Tessel.I2C = function(params) {
   var frequency = 1e5;
 
+  if (params.address == null) {
+    throw new Error('Tessel.I2C expected an address');
+  }
+
   Object.defineProperties(this, {
     frequency: {
       get: () => {
@@ -780,8 +823,12 @@ Tessel.I2C = function(params) {
   });
 
   this._port = params.port;
-  this.addr = params.addr;
-  this.frequency = params.freq ? params.freq : 100000; // 100khz
+
+  // For t1-firmware compatibility, this.addr = ...
+  this.addr = this.address = params.address;
+
+  // This is setting the accessor defined above
+  this.frequency = params.frequency ? params.frequency : 100000; // 100khz
 
   // Send the ENABLE_I2C command when the first I2C device is instantiated
   if (!this._port.I2C.enabled) {
@@ -801,7 +848,7 @@ Tessel.I2C.computeBaud = function(frequency) {
 
 Tessel.I2C.prototype.send = function(data, callback) {
   this._port.cork();
-  this._port._simple_cmd([CMD.START, this.addr << 1]);
+  this._port._simple_cmd([CMD.START, this.address << 1]);
   this._port._tx(data);
   this._port._simple_cmd([CMD.STOP], callback);
   this._port.uncork();
@@ -809,7 +856,7 @@ Tessel.I2C.prototype.send = function(data, callback) {
 
 Tessel.I2C.prototype.read = function(length, callback) {
   this._port.cork();
-  this._port._simple_cmd([CMD.START, this.addr << 1 | 1]);
+  this._port._simple_cmd([CMD.START, this.address << 1 | 1]);
   this._port._rx(length, callback);
   this._port._simple_cmd([CMD.STOP]);
   this._port.uncork();
@@ -818,10 +865,10 @@ Tessel.I2C.prototype.read = function(length, callback) {
 Tessel.I2C.prototype.transfer = function(txbuf, rxlen, callback) {
   this._port.cork();
   if (txbuf.length > 0) {
-    this._port._simple_cmd([CMD.START, this.addr << 1]);
+    this._port._simple_cmd([CMD.START, this.address << 1]);
     this._port._tx(txbuf);
   }
-  this._port._simple_cmd([CMD.START, this.addr << 1 | 1]);
+  this._port._simple_cmd([CMD.START, this.address << 1 | 1]);
   this._port._rx(rxlen, callback);
   this._port._simple_cmd([CMD.STOP]);
   this._port.uncork();
