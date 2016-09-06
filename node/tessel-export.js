@@ -94,12 +94,33 @@ var pwmBankSettings = {
   prescalarIndex: 0,
 };
 
-Tessel.prototype.close = function() {
-  ['A', 'B'].forEach(function(name) {
-    if (this.port[name]) {
-      this.port[name].sock.destroy();
+Tessel.prototype.close = function(portName) {
+  if (portName !== undefined) {
+    // This _could_ be combined with the above condition,
+    // but is separate since the open() method has a
+    // necessarily nested condition and this _may_ require
+    // further conditional restrictions in the future.
+    if (this.port[portName]) {
+      this.port[portName].close();
     }
-  }, this);
+  } else {
+    ['A', 'B'].forEach(name => this.close(name));
+  }
+  return this;
+};
+
+Tessel.prototype.open = function(portName) {
+  if (portName !== undefined) {
+    // If there _is not_ a port created with this port name;
+    // Or there _is_, but the socket was previously destroyed...
+    if (!this.port[portName] ||
+      (this.port[portName] && this.port[portName].sock.destroyed)) {
+      this.port[portName] = new Tessel.Port(portName, Tessel.Port.PATH[portName], this);
+    }
+  } else {
+    ['A', 'B'].forEach(name => this.open(name));
+  }
+  return this;
 };
 
 Tessel.prototype.pwmFrequency = function(frequency, cb) {
@@ -184,17 +205,25 @@ Tessel.Port = function(name, socketPath, board) {
   // if nothing else is waiting in the event queue.
   this.unref();
 
-  this.sock.on('error', function(e) {
-    console.log('we had a socket err', e);
+  this.sock.on('error', error => {
+    console.log('Socket: Error occurred, ', error);
   });
 
-  this.sock.on('end', function() {
-    console.log('the other socket end closed!');
+  this.sock.on('end', () => {
+    console.log('Socket: The other end sent FIN packet.');
   });
 
-  this.sock.on('close', function() {
-    throw new Error('Port socket closed');
+  this.sock.on('close', () => {
+    if (!this.sock.isAllowedToClose) {
+      throw new Error('Socket: The Port socket has closed.');
+    }
   });
+
+  // Track whether the port should treat closing
+  // as an error. This will be set to true when `tessel.close()`
+  // is called, to indicate that the closing is intentional and
+  // therefore should be allow to proceed.
+  this.sock.isAllowedToClose = false;
 
   var replyBuf = new Buffer(0);
 
@@ -226,7 +255,7 @@ Tessel.Port = function(name, socketPath, board) {
           // If a uart port was instantiated
           if (this._uart) {
             // Push this data into the buffer
-            this._uart.push(rxData.toString());
+            this._uart.push(rxData);
           }
           // Something went wrong and the packet is malformed
         } else {
@@ -408,6 +437,13 @@ Tessel.Port = function(name, socketPath, board) {
 };
 
 util.inherits(Tessel.Port, EventEmitter);
+
+Tessel.Port.prototype.close = function() {
+  if (!this.sock.destroyed) {
+    this.sock.isAllowedToClose = true;
+    this.sock.destroy();
+  }
+};
 
 Tessel.Port.prototype.ref = function() {
   // Increase the number of pending tasks
@@ -730,19 +766,18 @@ Tessel.Pin.prototype.resolution = ANALOG_RESOLUTION;
 
 Tessel.Pin.prototype.analogRead = function(cb) {
   if (!this.analogSupported) {
-    console.warn('pin.analogRead is not supoprted on this pin. Analog read is supported on port A pins 4 and 7 and on all pins on port B');
-    return this;
+    throw new RangeError('pin.analogRead is not supported on this pin. Analog read is supported on port A pins 4 and 7 and on all pins on port B');
   }
 
   if (typeof cb !== 'function') {
-    console.warn('analogPin.read is async, pass in a callback to get the value');
+    throw new Error('analogPin.read is async, pass in a callback to get the value');
   }
 
   this._port.sock.write(new Buffer([CMD.ANALOG_READ, this.pin]));
   this._port.enqueue({
     size: 2,
     callback: function(err, data) {
-      cb(err, (data[0] + (data[1] << 8)) / ANALOG_RESOLUTION * 3.3);
+      cb(err, (data[0] + (data[1] << 8)) / ANALOG_RESOLUTION);
     },
   });
 
@@ -755,10 +790,9 @@ Tessel.Pin.prototype.analogWrite = function(val) {
     throw new RangeError('Analog write can only be used on Pin 7 (G3) of Port B.');
   }
 
-  // v_dac = data/(0x3ff)*reference voltage
-  var data = val / 3.3 * 0x3ff;
-  if (data > 1023 || data < 0) {
-    throw new RangeError('Analog write must be between 0 and 3.3');
+  var data = val * 0x3ff;
+  if (data > 0x3ff || data < 0) {
+    throw new RangeError('Analog write must be between 0 and 1');
   }
 
   this._port.sock.write(new Buffer([CMD.ANALOG_WRITE, data >> 8, data & 0xff]));
@@ -1189,19 +1223,10 @@ Tessel.LED.prototype.read = function(callback) {
 
 Tessel.Wifi = function() {
   var state = {
-    settings: {},
-    connected: false
+    settings: {}
   };
 
   Object.defineProperties(this, {
-    isConnected: {
-      get: () => state.connected
-    },
-    connected: {
-      set: (value) => {
-        state.connected = value;
-      }
-    },
     settings: {
       get: () => state.settings,
       set: (settings) => {
@@ -1221,9 +1246,10 @@ Tessel.Wifi.prototype.enable = function(callback) {
   turnOnWifi()
     .then(commitWireless)
     .then(restartWifi)
-    .then(() => {
+    .then(getWifiInfo)
+    .then((network) => {
+      Object.assign(this.settings, network);
       this.emit('connect', this.settings);
-      this.connected = true;
       callback();
     })
     .catch((error) => {
@@ -1242,7 +1268,6 @@ Tessel.Wifi.prototype.disable = function(callback) {
     .then(commitWireless)
     .then(restartWifi)
     .then(() => {
-      this.connected = false;
       this.emit('disconnect');
       callback();
     })
@@ -1257,11 +1282,11 @@ Tessel.Wifi.prototype.reset = function(callback) {
     callback = function() {};
   }
 
-  this.connected = false;
   this.emit('disconnect', 'Resetting connection');
   restartWifi()
-    .then(() => {
-      this.connected = true;
+    .then(getWifiInfo)
+    .then((network) => {
+      Object.assign(this.settings, network);
       this.emit('connect', this.settings);
       callback();
     })
@@ -1271,12 +1296,34 @@ Tessel.Wifi.prototype.reset = function(callback) {
     });
 };
 
-Tessel.Wifi.prototype.connection = function() {
-  if (this.isConnected) {
-    return this.settings;
-  } else {
-    return null;
+Tessel.Wifi.prototype.connection = function(callback) {
+  if (typeof callback !== 'function') {
+    callback = function() {};
   }
+
+  isEnabled()
+    .then((enabled) => {
+      if (enabled) {
+        getWifiInfo()
+          .then((network) => {
+            delete network.password;
+
+            this.settings = network;
+
+            callback(null, network);
+          })
+          .catch((error) => {
+            this.emit('error', error);
+            callback(error);
+          });
+      } else {
+        callback(null, null);
+      }
+    })
+    .catch((error) => {
+      this.emit('error', error);
+      callback(error);
+    });
 };
 
 Tessel.Wifi.prototype.connect = function(settings, callback) {
@@ -1306,7 +1353,6 @@ Tessel.Wifi.prototype.connect = function(settings, callback) {
       delete settings.password;
 
       this.settings = Object.assign(network, settings);
-      this.connected = true;
       this.emit('connect', this.settings);
 
       callback(null, this.settings);
@@ -1422,40 +1468,69 @@ function isEnabled() {
 function getWifiInfo() {
   return new Promise((resolve, reject) => {
     var checkCount = 0;
+    var rbcast = /(Bcast):([\w\.]+)/;
 
     function recursiveWifi() {
-      setImmediate(() => {
-        childProcess.exec(`ubus call iwinfo info '{"device":"wlan0"}'`, (error, results) => {
-          if (error) {
-            recursiveWifi();
-          } else {
-            try {
-              var network = JSON.parse(results);
+      childProcess.exec(`ubus call iwinfo info '{"device":"wlan0"}'`, (error, results) => {
+        if (error) {
+          recursiveWifi();
+        } else {
+          try {
+            var network = JSON.parse(results);
 
-              if (network.ssid === undefined) {
-                // using 6 because it's the lowest count with accurate results after testing
-                if (checkCount < 6) {
-                  checkCount++;
-                  recursiveWifi();
-                } else {
-                  var msg = 'Tessel is unable to connect, please check your credentials or list of available networks (using tessel.network.wifi.findAvailableNetworks()) and try again.';
-                  throw msg;
-                }
+            if (network.ssid === undefined) {
+              // using 6 because it's the lowest count with accurate results after testing
+              if (checkCount < 6) {
+                checkCount++;
+                recursiveWifi();
               } else {
-                childProcess.exec('ifconfig wlan0', (error, ipResults) => {
-                  if (error) {
-                    reject(error);
-                  } else {
-                    network.ips = ipResults.split('\n');
-                    resolve(network);
-                  }
-                });
+                var msg = 'Tessel is unable to connect, please check your credentials or list of available networks (using tessel.network.wifi.findAvailableNetworks()) and try again.';
+                throw msg;
               }
-            } catch (error) {
-              reject(error);
+            } else {
+              recursiveIP(network);
+            }
+          } catch (error) {
+            reject(error);
+          }
+        }
+      });
+    }
+
+    // when immediately connecting and restarting the wifi chip, it takes a few moments before an IP address is broadcast to Tessel.
+    // This function keeps checking for that IP until it's available.
+    function recursiveIP(network) {
+      childProcess.exec('ifconfig wlan0', (error, ipResults) => {
+        if (error) {
+          reject(error);
+        } else {
+          var bcastMatches = ipResults.match(rbcast);
+
+          if (bcastMatches === null) {
+            recursiveWifi(network);
+          } else {
+            // Successful matches will have a result that looks like: 
+            // ["Bcast:0.0.0.0", "Bcast", "0.0.0.0"]
+            if (bcastMatches.length === 3) {
+              network.ip = bcastMatches[2];
+            } else {
+              recursiveWifi(network);
             }
           }
-        });
+
+          // attempt to parse out the security configuration from the returned network object
+          if (network.encryption.enabled) {
+            if (network.encryption.wep) {
+              network.security = 'wep';
+            } else if (network.encryption.authentication && network.encryption.wpa) {
+              // sets "security" to either psk or psk2
+              network.security = `${network.encryption.authentication[0]}${network.encryption.wpa[0] === 2 ? 2 : null}`;
+            }
+          } else {
+            network.security = 'none';
+          }
+          resolve(network);
+        }
       });
     }
 
@@ -1488,6 +1563,16 @@ function scanWifi() {
                 // Parse the security type - unused at the moment
                 security: encryptionRegex.exec(entry)[1],
               };
+
+              // normalize security info to match configuration settings, i.e. none, wep, psk, psk2. "none" is already set correctly
+              if (networkInfo.security.includes('WEP')) {
+                networkInfo.security = 'wep';
+              } else if (networkInfo.security.includes('WPA2')) {
+                networkInfo.security = 'psk2';
+              } else if (networkInfo.security.includes('WPA')) {
+                networkInfo.security = 'psk';
+              }
+
               // Add this parsed network to our array
               networks.push(networkInfo);
             } catch (error) {
